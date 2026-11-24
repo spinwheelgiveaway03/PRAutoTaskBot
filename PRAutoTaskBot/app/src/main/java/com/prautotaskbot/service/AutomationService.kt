@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.net.Uri
 import android.os.Build
 import android.view.Display
 import android.view.Gravity
@@ -62,6 +63,7 @@ class AutomationService : AccessibilityService() {
     private var checkAttempts = 0
     private var igRetries = 0
     private var idleTicks = 0
+    private var lastRefreshAt = 0L
     private var nextAllowedAt = 0L
     private var doneCount = 0
     private var lastShotError = 0
@@ -388,6 +390,16 @@ class AutomationService : AccessibilityService() {
             return
         }
 
+        val nextBtn = lines.firstOrNull { it.norm.contains("tugas berikutnya") }
+        if (check == null && nextBtn != null) {
+            if (!canStartNew(now)) return
+            tap(nextBtn.rect)
+            phase = Phase.LIST
+            phaseSince = now
+            setStatus("Lanjut ke tugas berikutnya…")
+            return
+        }
+
         if (!modalOpen) {
             if (phase == Phase.LIST) {
                 listStep(lines, now)
@@ -454,9 +466,11 @@ class AutomationService : AccessibilityService() {
         if (row == null) {
             idleTicks++
             setStatus("Tidak ada tugas Follow terlihat (OCR ${lines.size} baris)")
-            if (idleTicks >= 30) {
+            if (idleTicks >= 4 && now - lastRefreshAt > 20000) {
                 idleTicks = 0
-                launchBrowser()
+                lastRefreshAt = now
+                setStatus("Tugas habis, memuat ulang halaman…")
+                refreshPage()
             }
             return
         }
@@ -482,14 +496,14 @@ class AutomationService : AccessibilityService() {
         doneCount++
         doneTimes.add(now)
         resetTask()
-        nextAllowedAt = now + Random.nextLong(20000, 60000)
+        nextAllowedAt = now + Random.nextLong(5000, 10000)
         setStatus("✅ Tugas selesai. Jeda sebelum tugas berikutnya.")
     }
 
     private fun cancelTask(lines: List<OcrLine>, now: Long) {
         lines.firstOrNull { it.norm.contains("batalkan tugas") }?.let { tap(it.rect) }
         resetTask()
-        nextAllowedAt = now + 30000
+        nextAllowedAt = now + 8000
         setStatus("Tugas dibatalkan (gagal). Lanjut berikutnya.")
     }
 
@@ -517,6 +531,16 @@ class AutomationService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
+    private fun refreshPage() {
+        val pkg = browserPkg ?: return
+        try {
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://pr.social/tasks?net=instagram"))
+                .setPackage(pkg)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
+        } catch (_: Exception) {}
+    }
+
     private fun tap(r: Rect): Boolean {
         if (r.isEmpty) return false
         val path = Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
@@ -528,6 +552,6 @@ class AutomationService : AccessibilityService() {
 
     companion object {
         private const val IG_PACKAGE = "com.instagram.android"
-        private const val MAX_PER_HOUR = 30
+        private const val MAX_PER_HOUR = 50
     }
 }
