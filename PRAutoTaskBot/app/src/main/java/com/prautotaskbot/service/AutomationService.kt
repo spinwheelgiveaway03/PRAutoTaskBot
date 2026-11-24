@@ -41,8 +41,8 @@ class AutomationService : AccessibilityService() {
 
     private enum class Phase { LIST, IN_INSTAGRAM, IG_CLICKED, RETURNING, CHECKING }
 
-    private class OcrWord(text: String, val rect: Rect) {
-        val norm: String = text.lowercase().replace(Regex("[^a-z0-9]"), "")
+    private class OcrWord(val raw: String, val rect: Rect) {
+        val norm: String = raw.lowercase().replace(Regex("[^a-z0-9]"), "")
     }
 
     private class OcrLine(val text: String, val rect: Rect, val words: List<OcrWord>) {
@@ -67,6 +67,8 @@ class AutomationService : AccessibilityService() {
     private var checkAttempts = 0
     private var igRetries = 0
     private var igAttempts = 0
+    private var targetUser: String? = null
+    private var tapY = -1
     private var verifiedFollow = false
     private var cancelAfterReturn = false
     private var idleTicks = 0
@@ -189,7 +191,7 @@ class AutomationService : AccessibilityService() {
         loopJob?.cancel()
         loopJob = scope.launch {
             while (isActive) {
-                delay(Random.nextLong(1800, 3200))
+                delay(Random.nextLong(700, 1100))
                 if (!enabled) continue
                 try {
                     tick()
@@ -311,39 +313,94 @@ class AutomationService : AccessibilityService() {
         }
 
         val h = resources.displayMetrics.heightPixels
-        // Hanya baris yang isinya kata-kata tombol (Ikuti, Kirim Pesan, Berlangganan, dst).
-        val strict = lines.filter { l ->
-            l.words.isNotEmpty() && l.words.all { it.norm in BUTTON_WORDS || it.norm.length <= 2 }
+        val allWords = lines.flatMap { it.words }
+
+        // Batas atas: di bawah baris statistik (postingan/pengikut)
+        val statY = allWords
+            .filter { it.norm == "postingan" || it.norm == "posts" || it.norm == "pengikut" || it.norm == "followers" }
+            .filter { it.rect.centerY() < h * 0.30 }
+            .maxOfOrNull { it.rect.centerY() } ?: (h * 0.15).toInt()
+        val topLimit = statY + 40
+
+        // Batas bawah: sebelum "Disarankan untuk Anda" (di bawahnya ada tombol Ikuti akun lain!)
+        val headingY = lines
+            .filter { it.norm.contains("disarankan untuk") || it.norm.contains("suggested for") }
+            .minOfOrNull { it.rect.top }
+        val bottomLimit = headingY?.minus(10) ?: (h * 0.88).toInt()
+
+        // Semua kata di area profil target (di bawah statistik, di atas "Disarankan")
+        val zoneLines = lines.filter { l ->
+            l.words.size <= 6 && l.rect.centerY() in topLimit until bottomLimit
         }
-        val cands = strict.flatMap { it.words }.filter {
-            it.rect.centerY() > h * 0.26 && it.rect.centerY() < h * 0.65
+
+        // Baris yang HANYA berisi kata tombol (Ikuti, Kirim Pesan, Berlangganan, Kontak, dst).
+        // Kalimat bio seperti "Ikuti kami di TikTok" tidak lolos.
+        val strictLines = zoneLines.filter { l ->
+            l.words.all { it.norm in BUTTON_WORDS || it.norm.length <= 2 || it.norm.startsWith("mengik") }
         }
-        val following = cands.firstOrNull { it.norm in FOLLOWING_WORDS }
-        val followBtn = cands.firstOrNull { it.norm in FOLLOW_WORDS }
+
+        // Jangkar: tombol milik profil ini selalu satu baris dengan tombol lain seperti Kirim Pesan.
+        val anchorYs = zoneLines.flatMap { it.words }
+            .filter { it.norm in ANCHOR_WORDS }
+            .map { it.rect.centerY() }
+
+        fun pick(pred: (OcrWord) -> Boolean): OcrWord? {
+            // 1. satu baris dengan tombol jangkar (paling pasti)
+            if (anchorYs.isNotEmpty()) {
+                zoneLines.flatMap { it.words }
+                    .filter { pred(it) && anchorYs.any { y -> abs(y - it.rect.centerY()) < 70 } }
+                    .minByOrNull { it.rect.centerY() }
+                    ?.let { return it }
+            }
+            // 2. baris yang isinya hanya kata tombol, ambil yang PALING ATAS
+            strictLines.flatMap { it.words }
+                .filter { pred(it) }
+                .minByOrNull { it.rect.centerY() }
+                ?.let { return it }
+            // 3. cadangan terakhir: baris sangat pendek, paling atas
+            return zoneLines.filter { it.words.size <= 3 }
+                .flatMap { it.words }
+                .filter { pred(it) }
+                .minByOrNull { it.rect.centerY() }
+        }
+
+        val following = pick { it.norm.startsWith("mengik") || it.norm in FOLLOWING_WORDS }
+        val followBtn = pick { it.norm in FOLLOW_WORDS }
+        val followingOk = following != null &&
+            (tapY < 0 || abs(following.rect.centerY() - tapY) < 150)
+
+        val onTarget = headerMatchesTarget(lines, h)
 
         when (phase) {
             Phase.IN_INSTAGRAM -> {
-                if (following != null) {
+                if (!onTarget) {
+                    if (now - phaseSince > PROFILE_TIMEOUT) {
+                        retryProfile(now, "Profil bukan target")
+                    } else {
+                        setStatus("Menunggu profil @${targetUser ?: "?"}…")
+                    }
+                } else if (following != null) {
                     verifiedFollow = true
                     returnToBrowser(now, "Sudah mengikuti")
                 } else if (followBtn != null) {
                     tap(followBtn.rect)
+                    tapY = followBtn.rect.centerY()
                     phase = Phase.IG_CLICKED
                     phaseSince = now
                     igRetries = 0
                     setStatus("Menekan tombol Ikuti…")
                 } else if (now - phaseSince > PROFILE_TIMEOUT) {
-                    retryProfile(now, "Profil lama / tombol Ikuti tidak ketemu")
+                    retryProfile(now, "Tombol Ikuti tidak ketemu")
                 } else {
                     setStatus("Mencari tombol Ikuti… (percobaan ${igAttempts + 1}/$MAX_PROFILE_TRIES)")
                 }
             }
             Phase.IG_CLICKED -> {
-                if (following != null) {
+                if (onTarget && followingOk) {
                     verifiedFollow = true
                     returnToBrowser(now, "Berhasil mengikuti")
-                } else if (now - phaseSince > 6000) {
-                    if (followBtn != null && igRetries < 2) {
+                } else if (now - phaseSince > 3500) {
+                    if (onTarget && followBtn != null && igRetries < 2) {
                         igRetries++
                         tap(followBtn.rect)
                         phaseSince = now
@@ -353,13 +410,39 @@ class AutomationService : AccessibilityService() {
                 }
             }
             Phase.RETURNING -> {
-                if (now - phaseSince > 4000) {
+                if (now - phaseSince > 3000) {
                     launchBrowser()
                     phaseSince = now
                 }
             }
             else -> {}
         }
+    }
+
+    /** Cocokkan nama akun di judul profil Instagram dengan akun target dari PR.SOCIAL. */
+    private fun headerMatchesTarget(lines: List<OcrLine>, h: Int): Boolean {
+        val t = targetUser?.filter { it.isLetterOrDigit() } ?: return true
+        if (t.length < 3) return true
+        val hdr = lines
+            .filter { it.rect.centerY() in (h * 0.04).toInt()..(h * 0.12).toInt() }
+            .joinToString("") { it.norm }
+            .filter { it.isLetterOrDigit() }
+        if (hdr.isEmpty()) return true
+        if (hdr.contains(t)) return true
+        if (hdr.length >= 5 && t.contains(hdr)) return true
+        var n = 0
+        while (n < hdr.length && n < t.length && hdr[n] == t[n]) n++
+        return n >= minOf(6, t.length)
+    }
+
+    /** Ambil @username target dari jendela tugas PR.SOCIAL. */
+    private fun parseTarget(lines: List<OcrLine>): String? {
+        val badge = lines.firstOrNull { it.norm.contains("sedang dikerjakan") } ?: return null
+        val w = lines.flatMap { it.words }.firstOrNull {
+            it.raw.startsWith("@") && abs(it.rect.centerY() - badge.rect.centerY()) < 70
+        } ?: return null
+        val name = w.raw.removePrefix("@").lowercase().filter { it.isLetterOrDigit() || it == '.' || it == '_' }
+        return name.ifEmpty { null }
     }
 
     private fun returnToBrowser(now: Long, msg: String) {
@@ -373,6 +456,7 @@ class AutomationService : AccessibilityService() {
     private fun retryProfile(now: Long, msg: String) {
         igAttempts++
         verifiedFollow = false
+        tapY = -1
         cancelAfterReturn = igAttempts >= MAX_PROFILE_TRIES
         if (browserPkg != null) launchBrowser() else performGlobalAction(GLOBAL_ACTION_BACK)
         phase = Phase.RETURNING
@@ -435,6 +519,7 @@ class AutomationService : AccessibilityService() {
         when (phase) {
             Phase.LIST -> {
                 if (!canStartNew(now)) return
+                targetUser = parseTarget(lines)
                 tapLink(lines)
                 phase = Phase.IN_INSTAGRAM
                 phaseSince = now
@@ -443,11 +528,12 @@ class AutomationService : AccessibilityService() {
                 igAttempts = 0
                 verifiedFollow = false
                 cancelAfterReturn = false
+                tapY = -1
                 setStatus("Membuka profil Instagram…")
             }
             Phase.IN_INSTAGRAM -> {
                 // Masih di halaman tugas: link belum membuka Instagram
-                if (now - phaseSince > 12000) {
+                if (now - phaseSince > 8000) {
                     igAttempts++
                     if (igAttempts >= MAX_PROFILE_TRIES) {
                         cancelTask(lines, now)
@@ -475,7 +561,7 @@ class AutomationService : AccessibilityService() {
                 }
             }
             Phase.CHECKING -> {
-                if (now - phaseSince > 9000) {
+                if (now - phaseSince > 7000) {
                     if (checkAttempts >= 3) {
                         cancelTask(lines, now)
                     } else {
@@ -501,7 +587,7 @@ class AutomationService : AccessibilityService() {
         if (row == null) {
             idleTicks++
             setStatus("Tidak ada tugas Follow terlihat (OCR ${lines.size} baris)")
-            if (idleTicks >= 4 && now - lastRefreshAt > 20000) {
+            if (idleTicks >= 4 && now - lastRefreshAt > 15000) {
                 idleTicks = 0
                 lastRefreshAt = now
                 setStatus("Tugas habis, memuat ulang halaman…")
@@ -537,14 +623,14 @@ class AutomationService : AccessibilityService() {
         doneCount++
         doneTimes.add(now)
         resetTask()
-        nextAllowedAt = now + Random.nextLong(5000, 10000)
+        nextAllowedAt = now + Random.nextLong(2000, 4000)
         setStatus("✅ Tugas selesai. Jeda sebelum tugas berikutnya.")
     }
 
     private fun cancelTask(lines: List<OcrLine>, now: Long) {
         lines.firstOrNull { it.norm.contains("batalkan tugas") }?.let { tap(it.rect) }
         resetTask()
-        nextAllowedAt = now + 8000
+        nextAllowedAt = now + 4000
         setStatus("Tugas dibatalkan (gagal). Lanjut berikutnya.")
     }
 
@@ -556,6 +642,7 @@ class AutomationService : AccessibilityService() {
         igAttempts = 0
         verifiedFollow = false
         cancelAfterReturn = false
+        tapY = -1
     }
 
     private fun recentCount(now: Long): Int {
@@ -598,12 +685,17 @@ class AutomationService : AccessibilityService() {
         private const val IG_PACKAGE = "com.instagram.android"
         private const val MAX_PER_HOUR = 50
         private const val MAX_PROFILE_TRIES = 5
-        private const val PROFILE_TIMEOUT = 35_000L
+        private const val PROFILE_TIMEOUT = 25_000L
         private val FOLLOW_WORDS = setOf("ikuti", "follow")
         private val FOLLOWING_WORDS = setOf("mengikuti", "following", "diminta", "requested")
+        private val ANCHOR_WORDS = setOf(
+            "kirim", "pesan", "message", "berlangganan", "subscribe", "kontak", "hubungi",
+            "contact", "email", "telepon", "call", "petunjuk", "directions"
+        )
         private val BUTTON_WORDS = setOf(
             "ikuti", "follow", "balik", "back", "kirim", "pesan", "message",
-            "berlangganan", "subscribe", "mengikuti", "following", "diminta", "requested"
+            "berlangganan", "subscribe", "mengikuti", "following", "diminta", "requested",
+            "kontak", "hubungi", "contact", "email", "telepon", "call", "petunjuk", "directions"
         )
     }
 }
