@@ -264,6 +264,14 @@ class AutomationService : AccessibilityService() {
         val check = findFirst(root, "Periksa follow saya")
 
         if (check == null) {
+            val start = findStartButton(root)
+            if (start != null) {
+                clickNode(start)
+                phase = Phase.LIST
+                phaseSince = now
+                setStatus("Menekan Mulai…")
+                return
+            }
             // Jendela tugas tidak terbuka
             when (phase) {
                 Phase.CHECKING -> {
@@ -419,13 +427,27 @@ class AutomationService : AccessibilityService() {
     private fun findAll(root: AccessibilityNodeInfo, text: String): List<AccessibilityNodeInfo> =
         root.findAccessibilityNodeInfosByText(text) ?: emptyList()
 
+    private fun onScreen(n: AccessibilityNodeInfo): Boolean {
+        if (n.isVisibleToUser) return true
+        val r = Rect()
+        n.getBoundsInScreen(r)
+        val h = resources.displayMetrics.heightPixels
+        return r.width() > 0 && r.height() > 0 && r.top >= 0 && r.bottom <= h
+    }
+
     private fun findFirst(root: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? =
-        findAll(root, text).firstOrNull { it.isVisibleToUser }
+        findAll(root, text).firstOrNull { onScreen(it) }
+
+    private fun findStartButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+        findAll(root, "Mulai").firstOrNull { n ->
+            val t = n.text?.toString()?.trim() ?: n.contentDescription?.toString()?.trim() ?: ""
+            t.startsWith("Mulai", ignoreCase = true) && t.contains("$") && onScreen(n)
+        }
 
     private fun findExact(root: AccessibilityNodeInfo, vararg labels: String): AccessibilityNodeInfo? {
         for (label in labels) {
             val hit = findAll(root, label).firstOrNull { n ->
-                n.isVisibleToUser && (
+                onScreen(n) && (
                     n.text?.toString()?.trim().equals(label, ignoreCase = true) ||
                         n.contentDescription?.toString()?.trim().equals(label, ignoreCase = true)
                     )
