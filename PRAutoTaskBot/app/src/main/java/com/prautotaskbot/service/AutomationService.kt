@@ -41,7 +41,11 @@ class AutomationService : AccessibilityService() {
 
     private enum class Phase { LIST, IN_INSTAGRAM, IG_CLICKED, RETURNING, CHECKING }
 
-    private class OcrLine(val text: String, val rect: Rect) {
+    private class OcrWord(text: String, val rect: Rect) {
+        val norm: String = text.lowercase().replace(Regex("[^a-z0-9]"), "")
+    }
+
+    private class OcrLine(val text: String, val rect: Rect, val words: List<OcrWord>) {
         val norm: String = text.lowercase().replace(Regex("\\s+"), " ").trim()
     }
 
@@ -62,6 +66,9 @@ class AutomationService : AccessibilityService() {
     private var browserPkg: String? = null
     private var checkAttempts = 0
     private var igRetries = 0
+    private var igAttempts = 0
+    private var verifiedFollow = false
+    private var cancelAfterReturn = false
     private var idleTicks = 0
     private var lastRefreshAt = 0L
     private var nextAllowedAt = 0L
@@ -269,7 +276,12 @@ class AutomationService : AccessibilityService() {
                 for (b in t.textBlocks) {
                     for (l in b.lines) {
                         val r = l.boundingBox ?: continue
-                        out.add(OcrLine(l.text, r))
+                        val ws = ArrayList<OcrWord>()
+                        for (e in l.elements) {
+                            val er = e.boundingBox ?: continue
+                            ws.add(OcrWord(e.text, er))
+                        }
+                        out.add(OcrLine(l.text, r, ws))
                     }
                 }
                 cont.resume(out)
@@ -299,29 +311,20 @@ class AutomationService : AccessibilityService() {
         }
 
         val h = resources.displayMetrics.heightPixels
-        val msg = lines.firstOrNull { it.norm == "kirim pesan" || it.norm == "message" }
-
-        fun rowItem(pred: (String) -> Boolean): OcrLine? {
-            val cands = lines.filter { pred(it.norm) }
-            return if (msg != null) {
-                cands.minByOrNull { abs(it.rect.centerY() - msg.rect.centerY()) }
-                    ?.takeIf { abs(it.rect.centerY() - msg.rect.centerY()) < 90 }
-            } else {
-                cands.firstOrNull { it.rect.centerY() < h * 0.6 }
-            }
+        // Hanya baris yang isinya kata-kata tombol (Ikuti, Kirim Pesan, Berlangganan, dst).
+        val strict = lines.filter { l ->
+            l.words.isNotEmpty() && l.words.all { it.norm in BUTTON_WORDS || it.norm.length <= 2 }
         }
-
-        val following = rowItem {
-            it.startsWith("mengikuti") || it.startsWith("following") ||
-                it.startsWith("diminta") || it.startsWith("requested")
+        val cands = strict.flatMap { it.words }.filter {
+            it.rect.centerY() > h * 0.26 && it.rect.centerY() < h * 0.65
         }
-        val followBtn = rowItem {
-            it == "ikuti" || it == "follow" || it == "ikuti balik" || it == "follow back"
-        }
+        val following = cands.firstOrNull { it.norm in FOLLOWING_WORDS }
+        val followBtn = cands.firstOrNull { it.norm in FOLLOW_WORDS }
 
         when (phase) {
             Phase.IN_INSTAGRAM -> {
                 if (following != null) {
+                    verifiedFollow = true
                     returnToBrowser(now, "Sudah mengikuti")
                 } else if (followBtn != null) {
                     tap(followBtn.rect)
@@ -329,22 +332,23 @@ class AutomationService : AccessibilityService() {
                     phaseSince = now
                     igRetries = 0
                     setStatus("Menekan tombol Ikuti…")
-                } else if (now - phaseSince > 25000) {
-                    returnToBrowser(now, "Tombol Ikuti tidak ketemu")
+                } else if (now - phaseSince > PROFILE_TIMEOUT) {
+                    retryProfile(now, "Profil lama / tombol Ikuti tidak ketemu")
                 } else {
-                    setStatus("Menunggu profil Instagram…")
+                    setStatus("Mencari tombol Ikuti… (percobaan ${igAttempts + 1}/$MAX_PROFILE_TRIES)")
                 }
             }
             Phase.IG_CLICKED -> {
                 if (following != null) {
+                    verifiedFollow = true
                     returnToBrowser(now, "Berhasil mengikuti")
-                } else if (now - phaseSince > 7000) {
-                    if (followBtn != null && igRetries < 1) {
+                } else if (now - phaseSince > 6000) {
+                    if (followBtn != null && igRetries < 2) {
                         igRetries++
                         tap(followBtn.rect)
                         phaseSince = now
                     } else {
-                        returnToBrowser(now, "Lanjut verifikasi")
+                        retryProfile(now, "Ikuti belum berhasil")
                     }
                 }
             }
@@ -363,6 +367,17 @@ class AutomationService : AccessibilityService() {
         phase = Phase.RETURNING
         phaseSince = now
         setStatus("$msg, kembali ke halaman tugas")
+    }
+
+    /** Gagal menemukan/menekan Ikuti: kembali ke web lalu buka profil lagi (bukan menekan Periksa). */
+    private fun retryProfile(now: Long, msg: String) {
+        igAttempts++
+        verifiedFollow = false
+        cancelAfterReturn = igAttempts >= MAX_PROFILE_TRIES
+        if (browserPkg != null) launchBrowser() else performGlobalAction(GLOBAL_ACTION_BACK)
+        phase = Phase.RETURNING
+        phaseSince = now
+        setStatus("$msg. Ulangi buka profil ($igAttempts/$MAX_PROFILE_TRIES)")
     }
 
     // ---------------------------------------------------------------- Halaman tugas
@@ -420,24 +435,44 @@ class AutomationService : AccessibilityService() {
         when (phase) {
             Phase.LIST -> {
                 if (!canStartNew(now)) return
-                val link = lines.firstOrNull { it.norm.contains("instagram.com") }
-                    ?: lines.firstOrNull { it.norm.contains("buka profil dan ikuti") }
-                if (link != null) tap(link.rect)
+                tapLink(lines)
                 phase = Phase.IN_INSTAGRAM
                 phaseSince = now
                 checkAttempts = 0
                 igRetries = 0
+                igAttempts = 0
+                verifiedFollow = false
+                cancelAfterReturn = false
                 setStatus("Membuka profil Instagram…")
             }
             Phase.IN_INSTAGRAM -> {
-                if (now - phaseSince > 40000) cancelTask(lines, now)
+                // Masih di halaman tugas: link belum membuka Instagram
+                if (now - phaseSince > 12000) {
+                    igAttempts++
+                    if (igAttempts >= MAX_PROFILE_TRIES) {
+                        cancelTask(lines, now)
+                    } else {
+                        tapLink(lines)
+                        phaseSince = now
+                        setStatus("Link belum terbuka, coba lagi ($igAttempts/$MAX_PROFILE_TRIES)")
+                    }
+                }
             }
             Phase.IG_CLICKED, Phase.RETURNING -> {
-                tap(check.rect)
-                phase = Phase.CHECKING
-                phaseSince = now
-                checkAttempts = 1
-                setStatus("Menekan tombol periksa…")
+                if (cancelAfterReturn) {
+                    cancelTask(lines, now)
+                } else if (!verifiedFollow) {
+                    tapLink(lines)
+                    phase = Phase.IN_INSTAGRAM
+                    phaseSince = now
+                    setStatus("Membuka ulang profil Instagram…")
+                } else {
+                    tap(check.rect)
+                    phase = Phase.CHECKING
+                    phaseSince = now
+                    checkAttempts = 1
+                    setStatus("Follow terverifikasi, menekan periksa…")
+                }
             }
             Phase.CHECKING -> {
                 if (now - phaseSince > 9000) {
@@ -480,6 +515,12 @@ class AutomationService : AccessibilityService() {
         setStatus("Membuka tugas…")
     }
 
+    private fun tapLink(lines: List<OcrLine>) {
+        val link = lines.firstOrNull { it.norm.contains("instagram.com") }
+            ?: lines.firstOrNull { it.norm.contains("buka profil dan ikuti") }
+        if (link != null) tap(link.rect)
+    }
+
     private fun canStartNew(now: Long): Boolean {
         if (now < nextAllowedAt) {
             setStatus("Jeda ${(nextAllowedAt - now) / 1000} detik…")
@@ -512,6 +553,9 @@ class AutomationService : AccessibilityService() {
         phaseSince = System.currentTimeMillis()
         checkAttempts = 0
         igRetries = 0
+        igAttempts = 0
+        verifiedFollow = false
+        cancelAfterReturn = false
     }
 
     private fun recentCount(now: Long): Int {
@@ -553,5 +597,13 @@ class AutomationService : AccessibilityService() {
     companion object {
         private const val IG_PACKAGE = "com.instagram.android"
         private const val MAX_PER_HOUR = 50
+        private const val MAX_PROFILE_TRIES = 5
+        private const val PROFILE_TIMEOUT = 35_000L
+        private val FOLLOW_WORDS = setOf("ikuti", "follow")
+        private val FOLLOWING_WORDS = setOf("mengikuti", "following", "diminta", "requested")
+        private val BUTTON_WORDS = setOf(
+            "ikuti", "follow", "balik", "back", "kirim", "pesan", "message",
+            "berlangganan", "subscribe", "mengikuti", "following", "diminta", "requested"
+        )
     }
 }
