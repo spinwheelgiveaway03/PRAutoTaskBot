@@ -93,6 +93,9 @@ dependencies {
     // Gson for simple serialization if needed
     implementation("com.google.code.gson:gson:2.11.0")
 
+    // OCR di perangkat (baca tulisan layar)
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
