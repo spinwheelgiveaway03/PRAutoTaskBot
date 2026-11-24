@@ -184,6 +184,9 @@ class AutomationService : AccessibilityService() {
         if (isPrSocial(root)) {
             browserPkg = pkg
             handlePr(root, now)
+        } else if (findAll(root, "pr.social").isNotEmpty()) {
+            browserPkg = pkg
+            setStatus("Isi halaman tidak terbaca (node=${countNodes(root)})")
         }
     }
 
@@ -229,7 +232,7 @@ class AutomationService : AccessibilityService() {
                 }
             }
             Phase.RETURNING -> {
-                if (now - phaseSince > 3500) {
+                if (now - phaseSince > 4000) {
                     launchBrowser()
                     phaseSince = now
                 }
@@ -239,7 +242,7 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun returnToBrowser(now: Long, msg: String) {
-        performGlobalAction(GLOBAL_ACTION_BACK)
+        if (browserPkg != null) launchBrowser() else performGlobalAction(GLOBAL_ACTION_BACK)
         phase = Phase.RETURNING
         phaseSince = now
         setStatus("$msg → kembali ke PR.SOCIAL")
@@ -256,16 +259,22 @@ class AutomationService : AccessibilityService() {
     // ---------------------------------------------------------------- PR.SOCIAL
 
     private fun isPrSocial(root: AccessibilityNodeInfo): Boolean {
-        val keys = listOf("Periksa follow saya", "Ikuti di Instagram", "PR.SOCIAL")
+        val keys = listOf("Periksa follow saya", "Ikuti di Instagram", "Buka profil dan ikuti", "Mulai ·")
         return keys.any { findAll(root, it).isNotEmpty() }
     }
 
     private fun handlePr(root: AccessibilityNodeInfo, now: Long) {
         val check = findFirst(root, "Periksa follow saya")
 
+        if (phase == Phase.CHECKING && (check == null || findAll(root, "ditinjau").isNotEmpty())) {
+            onTaskDone(now)
+            return
+        }
+
         if (check == null) {
             val start = findStartButton(root)
             if (start != null) {
+                if (!canStartNew(now)) return
                 clickNode(start)
                 phase = Phase.LIST
                 phaseSince = now
@@ -293,6 +302,7 @@ class AutomationService : AccessibilityService() {
         // Jendela tugas terbuka
         when (phase) {
             Phase.LIST -> {
+                if (!canStartNew(now)) return
                 val link = findFirst(root, "instagram.com/")
                 val linkText = link?.text?.toString() ?: ""
                 currentUser = if (linkText.contains("…") || linkText.contains("...")) null
@@ -336,6 +346,18 @@ class AutomationService : AccessibilityService() {
         }
     }
 
+    private fun canStartNew(now: Long): Boolean {
+        if (now < nextAllowedAt) {
+            setStatus("Jeda ${(nextAllowedAt - now) / 1000} detik…")
+            return false
+        }
+        if (recentCount(now) >= MAX_PER_HOUR) {
+            setStatus("Batas $MAX_PER_HOUR/jam tercapai. Menunggu…")
+            return false
+        }
+        return true
+    }
+
     private fun listStep(root: AccessibilityNodeInfo, now: Long) {
         if (now < nextAllowedAt) {
             setStatus("Jeda ${(nextAllowedAt - now) / 1000} detik…")
@@ -348,7 +370,7 @@ class AutomationService : AccessibilityService() {
         val row = findFirst(root, "Ikuti di Instagram")
         if (row == null) {
             idleTicks++
-            setStatus("Tidak ada tugas Follow terlihat")
+            setStatus("Tidak ada tugas Follow terlihat (cocok=${findAll(root, "Ikuti di Instagram").size}, node=${countNodes(root)})")
             if (idleTicks >= 30) {
                 idleTicks = 0
                 refreshPage()
@@ -423,6 +445,16 @@ class AutomationService : AccessibilityService() {
     }
 
     // ---------------------------------------------------------------- Helper node
+
+    private fun countNodes(n: AccessibilityNodeInfo?, limit: Int = 3000): Int {
+        if (n == null) return 0
+        var c = 1
+        for (i in 0 until n.childCount) {
+            if (c >= limit) break
+            c += countNodes(n.getChild(i), limit - c)
+        }
+        return c
+    }
 
     private fun findAll(root: AccessibilityNodeInfo, text: String): List<AccessibilityNodeInfo> =
         root.findAccessibilityNodeInfosByText(text) ?: emptyList()
