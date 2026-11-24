@@ -75,12 +75,28 @@ class AutomationService : AccessibilityService() {
     private var lastRefreshAt = 0L
     private var nextAllowedAt = 0L
     private var doneCount = 0
+    private var recoverCount = 0
+    private var capReachedAt = 0L
+    private var lastProgressAt = 0L
+    private var lastPhaseSeen = Phase.LIST
+    private var recoverUntil = 0L
+    private val recoveryTimes = ArrayList<Long>()
     private var lastShotError = 0
     private val doneTimes = ArrayList<Long>()
+    private val dayTimes = ArrayList<Long>()
+    private var sinceBreak = 0
+    private var breakAfter = Random.nextInt(BREAK_EVERY_MIN, BREAK_EVERY_MAX + 1)
+    private var blockedUntil = 0L
+    private var warmStart = 0L
+    private var failStreak = 0
+    private val safePrefs by lazy { getSharedPreferences("safety", MODE_PRIVATE) }
     private var statusText = "Siap. Tekan tombol untuk mulai."
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        blockedUntil = safePrefs.getLong("blockedUntil", 0L)
+        warmStart = safePrefs.getLong("warmStart", 0L)
+        safePrefs.getString("dayTimes", "")?.split(",")?.mapNotNullTo(dayTimes) { it.toLongOrNull() }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         showOverlay()
         startLoop()
@@ -162,10 +178,20 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun toggleEnabled() {
+        val t0 = System.currentTimeMillis()
+        if (!enabled && t0 < blockedUntil) {
+            setStatus("⛔ Istirahat paksa setelah IG membatasi akun. Sisa ±${(blockedUntil - t0) / 3_600_000L + 1} jam.")
+            return
+        }
         enabled = !enabled
         if (enabled) {
             resetTask()
             nextAllowedAt = 0L
+            lastProgressAt = System.currentTimeMillis()
+            if (warmStart == 0L) {
+                warmStart = t0
+                safePrefs.edit().putLong("warmStart", warmStart).apply()
+            }
             setStatus("Bot jalan. Buka halaman Tugas.")
         } else {
             setStatus("Bot dimatikan.")
@@ -177,7 +203,7 @@ class AutomationService : AccessibilityService() {
             text = if (enabled) "🤖 AUTO: ON" else "🤖 AUTO: OFF"
             setBackgroundColor(if (enabled) 0xEE2E7D32.toInt() else 0xEEC62828.toInt())
         }
-        statusView?.text = "$statusText\n✔ $doneCount selesai | ${recentCount(System.currentTimeMillis())}/$MAX_PER_HOUR per jam"
+        statusView?.text = "$statusText\n✔ $doneCount selesai | ${recentCount(System.currentTimeMillis())}/$MAX_PER_HOUR per jam | ${dayCount(System.currentTimeMillis())}/${dayLimit(System.currentTimeMillis())} per hari | 🔄 $recoverCount"
     }
 
     private fun setStatus(s: String) {
@@ -191,7 +217,7 @@ class AutomationService : AccessibilityService() {
         loopJob?.cancel()
         loopJob = scope.launch {
             while (isActive) {
-                delay(Random.nextLong(700, 1100))
+                delay(Random.nextLong(400, 600))
                 if (!enabled) continue
                 try {
                     tick()
@@ -216,6 +242,24 @@ class AutomationService : AccessibilityService() {
         bmp.recycle()
         val ov = overlayRect()
         val lines = all.filter { !ov.contains(it.rect.centerX(), it.rect.centerY()) }
+
+        // --- Pemulih macet: batalkan tugas + muat ulang web
+        if (lastProgressAt == 0L || phase != lastPhaseSeen) {
+            lastPhaseSeen = phase
+            lastProgressAt = now
+        }
+        if (now >= recoverUntil) {
+            if (lines.any { it.norm.contains("tambahkan tangkapan layar") }) {
+                recover(lines, now, "Tugas minta tangkapan layar")
+                return
+            }
+            if (now < nextAllowedAt || recentCount(now) >= MAX_PER_HOUR || dayCount(now) >= dayLimit(now) || isQuietTime()) {
+                lastProgressAt = now // menunggu jeda/batas jam bukan macet
+            } else if (now - lastProgressAt > STUCK_MS) {
+                recover(lines, now, "Macet ${(now - lastProgressAt) / 1000} detik")
+                return
+            }
+        }
 
         if (pkg == IG_PACKAGE) {
             handleInstagram(lines, now)
@@ -303,11 +347,15 @@ class AutomationService : AccessibilityService() {
     private fun handleInstagram(lines: List<OcrLine>, now: Long) {
         if (lines.any {
                 it.norm.contains("coba lagi nanti") || it.norm.contains("try again later") ||
-                    it.norm.contains("tindakan diblokir") || it.norm.contains("action blocked")
+                    it.norm.contains("tindakan diblokir") || it.norm.contains("action blocked") ||
+                    it.norm.contains("mencurigakan") || it.norm.contains("suspicious") ||
+                    it.norm.contains("kami membatasi") || it.norm.contains("we restrict")
             }
         ) {
             enabled = false
-            setStatus("⛔ Instagram membatasi akun. Bot dimatikan, istirahat dulu.")
+            blockedUntil = now + BLOCK_LOCK_MS
+            safePrefs.edit().putLong("blockedUntil", blockedUntil).apply()
+            setStatus("⛔ Instagram membatasi akun. Bot dimatikan dan dikunci 12 jam.")
             Toast.makeText(this, "Instagram membatasi aksi. Bot dimatikan.", Toast.LENGTH_LONG).show()
             return
         }
@@ -399,7 +447,7 @@ class AutomationService : AccessibilityService() {
                 if (onTarget && followingOk) {
                     verifiedFollow = true
                     returnToBrowser(now, "Berhasil mengikuti")
-                } else if (now - phaseSince > 3500) {
+                } else if (now - phaseSince > 2500) {
                     if (onTarget && followBtn != null && igRetries < 2) {
                         igRetries++
                         tap(followBtn.rect)
@@ -410,7 +458,7 @@ class AutomationService : AccessibilityService() {
                 }
             }
             Phase.RETURNING -> {
-                if (now - phaseSince > 3000) {
+                if (now - phaseSince > 2000) {
                     launchBrowser()
                     phaseSince = now
                 }
@@ -454,6 +502,14 @@ class AutomationService : AccessibilityService() {
 
     /** Gagal menemukan/menekan Ikuti: kembali ke web lalu buka profil lagi (bukan menekan Periksa). */
     private fun retryProfile(now: Long, msg: String) {
+        failStreak++
+        if (failStreak >= MAX_FAIL_STREAK) {
+            enabled = false
+            blockedUntil = now + SOFT_LOCK_MS
+            safePrefs.edit().putLong("blockedUntil", blockedUntil).apply()
+            setStatus("⛔ Follow gagal berulang, kemungkinan dibatasi. Istirahat 3 jam.")
+            return
+        }
         igAttempts++
         verifiedFollow = false
         tapY = -1
@@ -502,7 +558,7 @@ class AutomationService : AccessibilityService() {
         if (!modalOpen) {
             if (phase == Phase.LIST) {
                 listStep(lines, now)
-            } else if (now - phaseSince > 15000) {
+            } else if (now - phaseSince > 10000) {
                 resetTask()
             } else {
                 setStatus("Menunggu halaman tugas…")
@@ -533,7 +589,7 @@ class AutomationService : AccessibilityService() {
             }
             Phase.IN_INSTAGRAM -> {
                 // Masih di halaman tugas: link belum membuka Instagram
-                if (now - phaseSince > 8000) {
+                if (now - phaseSince > 5000) {
                     igAttempts++
                     if (igAttempts >= MAX_PROFILE_TRIES) {
                         cancelTask(lines, now)
@@ -561,7 +617,7 @@ class AutomationService : AccessibilityService() {
                 }
             }
             Phase.CHECKING -> {
-                if (now - phaseSince > 7000) {
+                if (now - phaseSince > 5000) {
                     if (checkAttempts >= 3) {
                         cancelTask(lines, now)
                     } else {
@@ -586,8 +642,9 @@ class AutomationService : AccessibilityService() {
             .minByOrNull { it.rect.top }
         if (row == null) {
             idleTicks++
+            lastProgressAt = now
             setStatus("Tidak ada tugas Follow terlihat (OCR ${lines.size} baris)")
-            if (idleTicks >= 4 && now - lastRefreshAt > 15000) {
+            if (idleTicks >= 3 && now - lastRefreshAt > 8000) {
                 idleTicks = 0
                 lastRefreshAt = now
                 setStatus("Tugas habis, memuat ulang halaman…")
@@ -608,30 +665,69 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun canStartNew(now: Long): Boolean {
+        if (isQuietTime()) {
+            setStatus("😴 Jam istirahat bot ($QUIET_START:00-$QUIET_END:00). Lanjut otomatis.")
+            return false
+        }
         if (now < nextAllowedAt) {
             setStatus("Jeda ${(nextAllowedAt - now) / 1000} detik…")
             return false
         }
-        if (recentCount(now) >= MAX_PER_HOUR) {
-            setStatus("Batas $MAX_PER_HOUR per jam tercapai. Menunggu…")
+        if (dayCount(now) >= dayLimit(now)) {
+            setStatus("Batas harian ${dayLimit(now)} tercapai. Menunggu slot 24 jam…")
             return false
+        }
+        if (recentCount(now) >= MAX_PER_HOUR) {
+            if (!CAP_RESET_ENABLED) {
+                setStatus("Batas $MAX_PER_HOUR per jam tercapai. Menunggu…")
+                return false
+            }
+            if (capReachedAt == 0L) capReachedAt = now
+            val left = CAP_PAUSE_MS - (now - capReachedAt)
+            if (left > 0) {
+                setStatus("Batas $MAX_PER_HOUR tercapai. Lanjut ${left / 1000 + 1} detik lagi…")
+                return false
+            }
+            doneTimes.clear()
+            capReachedAt = 0L
+            setStatus("Hitungan di-reset ke 0/$MAX_PER_HOUR. Lanjut!")
         }
         return true
     }
 
     private fun onTaskDone(now: Long) {
         doneCount++
+        failStreak = 0
+        lastProgressAt = now
         doneTimes.add(now)
+        dayTimes.add(now)
+        saveDayTimes()
+        if (CAP_RESET_ENABLED && doneTimes.size >= MAX_PER_HOUR) capReachedAt = now
         resetTask()
-        nextAllowedAt = now + Random.nextLong(2000, 4000)
-        setStatus("✅ Tugas selesai. Jeda sebelum tugas berikutnya.")
+        sinceBreak++
+        if (sinceBreak >= breakAfter) {
+            sinceBreak = 0
+            breakAfter = Random.nextInt(BREAK_EVERY_MIN, BREAK_EVERY_MAX + 1)
+            val rest = Random.nextLong(BREAK_MIN_MS, BREAK_MAX_MS)
+            nextAllowedAt = now + rest
+            setStatus("☕ Istirahat ${rest / 60_000L} menit supaya akun aman.")
+        } else {
+            val pace = Random.nextLong(PACE_MIN_MS, PACE_MAX_MS)
+            nextAllowedAt = now + pace
+            setStatus("✅ Selesai. Jeda ${pace / 1000} detik (aman).")
+        }
     }
 
     private fun cancelTask(lines: List<OcrLine>, now: Long) {
-        lines.firstOrNull { it.norm.contains("batalkan tugas") }?.let { tap(it.rect) }
+        cancelRect(lines)?.let { tap(it) }
         resetTask()
-        nextAllowedAt = now + 4000
-        setStatus("Tugas dibatalkan (gagal). Lanjut berikutnya.")
+        lastProgressAt = now
+        nextAllowedAt = now + 1500
+        setStatus("Tugas dibatalkan (gagal). Muat ulang web…")
+        scope.launch {
+            delay(700)
+            refreshPage()
+        }
     }
 
     private fun resetTask() {
@@ -681,11 +777,88 @@ class AutomationService : AccessibilityService() {
         return dispatchGesture(gesture, null, null)
     }
 
+    /** Batas harian naik pelan-pelan (pemanasan akun) sampai MAX_PER_DAY. */
+    private fun dayLimit(now: Long): Int {
+        if (warmStart == 0L) return WARMUP_START
+        val days = ((now - warmStart) / 86_400_000L).toInt()
+        return minOf(MAX_PER_DAY, WARMUP_START + days * WARMUP_STEP)
+    }
+
+    private fun isQuietTime(): Boolean {
+        if (!QUIET_ENABLED) return false
+        val h = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        return h >= QUIET_START && h < QUIET_END
+    }
+
+    private fun dayCount(now: Long): Int {
+        dayTimes.removeAll { now - it > 86_400_000L }
+        return dayTimes.size
+    }
+
+    private fun saveDayTimes() {
+        safePrefs.edit().putString("dayTimes", dayTimes.joinToString(",")).apply()
+    }
+
+    /** Posisi tombol "Batalkan tugas" (dua kata saja, supaya tidak kena tombol sebelahnya). */
+    private fun cancelRect(lines: List<OcrLine>): Rect? {
+        for (l in lines) {
+            if (!l.norm.contains("batalkan tugas")) continue
+            val i = l.words.indexOfFirst { it.norm == "batalkan" }
+            if (i >= 0 && i + 1 < l.words.size && l.words[i + 1].norm == "tugas") {
+                return Rect(l.words[i].rect).apply { union(l.words[i + 1].rect) }
+            }
+            return l.rect
+        }
+        return null
+    }
+
+    /** Macet / layar aneh: klik Batalkan tugas, lalu muat ulang halaman PR.SOCIAL. */
+    private fun recover(lines: List<OcrLine>, now: Long, reason: String) {
+        recoveryTimes.removeAll { now - it > 600_000L }
+        recoveryTimes.add(now)
+        if (recoveryTimes.size > MAX_RECOVERIES_10MIN) {
+            enabled = false
+            setStatus("⛔ Terlalu sering macet ($reason). Bot dimatikan, cek manual.")
+            return
+        }
+        recoverCount++
+        cancelRect(lines)?.let { tap(it) }
+        resetTask()
+        lastProgressAt = now
+        recoverUntil = now + 2500
+        nextAllowedAt = now + 1500
+        setStatus("🔄 $reason. Batalkan tugas, muat ulang web…")
+        scope.launch {
+            delay(700)
+            if (browserPkg != null) refreshPage() else performGlobalAction(GLOBAL_ACTION_BACK)
+        }
+    }
+
     companion object {
+        private const val STUCK_MS = 30_000L
+        private const val MAX_RECOVERIES_10MIN = 8
         private const val IG_PACKAGE = "com.instagram.android"
-        private const val MAX_PER_HOUR = 50
+        // ---- Pengaman akun (ubah angka di sini kalau mau lebih cepat / lebih aman)
+        private const val MAX_PER_HOUR = 25
+        private const val MAX_PER_DAY = 150             // batas harian akhir (setelah pemanasan)
+        private const val WARMUP_START = 30             // hari ke-1 hanya 30 tugas
+        private const val WARMUP_STEP = 20              // naik 20 tugas tiap hari sampai MAX_PER_DAY
+        private const val QUIET_ENABLED = false         // bot tidur di jam sepi (pola wajar)
+        private const val QUIET_START = 12              // jam 12:00
+        private const val QUIET_END = 16                // sampai 16:00
+        private const val MAX_FAIL_STREAK = 8           // gagal ikuti berturut-turut -> istirahat
+        private const val SOFT_LOCK_MS = 10_800_000L    // istirahat 3 jam
+        private const val PACE_MIN_MS = 8_000L          // jeda antar tugas
+        private const val PACE_MAX_MS = 20_000L
+        private const val BREAK_EVERY_MIN = 8           // istirahat panjang tiap 8-14 tugas
+        private const val BREAK_EVERY_MAX = 14
+        private const val BREAK_MIN_MS = 180_000L       // lama istirahat 3-6 menit
+        private const val BREAK_MAX_MS = 360_000L
+        private const val BLOCK_LOCK_MS = 43_200_000L   // kunci 12 jam setelah dibatasi IG
+        private const val CAP_RESET_ENABLED = false     // true = reset 0/50 setelah 30 detik (berisiko)
+        private const val CAP_PAUSE_MS = 30_000L
         private const val MAX_PROFILE_TRIES = 5
-        private const val PROFILE_TIMEOUT = 25_000L
+        private const val PROFILE_TIMEOUT = 12_000L
         private val FOLLOW_WORDS = setOf("ikuti", "follow")
         private val FOLLOWING_WORDS = setOf("mengikuti", "following", "diminta", "requested")
         private val ANCHOR_WORDS = setOf(
