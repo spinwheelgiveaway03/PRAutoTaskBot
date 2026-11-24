@@ -3,18 +3,22 @@ package com.prautotaskbot.service
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
-import android.net.Uri
+import android.os.Build
+import android.view.Display
 import android.view.Gravity
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -22,19 +26,28 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.math.abs
 import kotlin.random.Random
 
 /**
- * Bot otomatis untuk tugas "Ikuti di Instagram" di PR.SOCIAL.
- * Berjalan di HP kamu sendiri lewat Accessibility Service, memakai akun kamu sendiri.
+ * Bot otomatis tugas "Ikuti di Instagram" di PR.SOCIAL.
+ * Cara kerja: potret layar -> baca tulisan (OCR, di HP, tanpa internet) -> ketuk posisi tulisan.
+ * Tidak bergantung pada browser mana pun.
  */
 class AutomationService : AccessibilityService() {
 
     private enum class Phase { LIST, IN_INSTAGRAM, IG_CLICKED, RETURNING, CHECKING }
 
+    private class OcrLine(val text: String, val rect: Rect) {
+        val norm: String = text.lowercase().replace(Regex("\\s+"), " ").trim()
+    }
+
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.Main + job)
     private var loopJob: Job? = null
+    private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
     private var windowManager: WindowManager? = null
     private var overlay: LinearLayout? = null
@@ -44,14 +57,14 @@ class AutomationService : AccessibilityService() {
     private var enabled = false
     private var phase = Phase.LIST
     private var phaseSince = 0L
+    private var currentPkg: String? = null
     private var browserPkg: String? = null
-    private var currentUser: String? = null
     private var checkAttempts = 0
     private var igRetries = 0
-    private var triedDirect = false
     private var idleTicks = 0
     private var nextAllowedAt = 0L
     private var doneCount = 0
+    private var lastShotError = 0
     private val doneTimes = ArrayList<Long>()
     private var statusText = "Siap. Tekan tombol untuk mulai."
 
@@ -62,7 +75,14 @@ class AutomationService : AccessibilityService() {
         startLoop()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        val p = event?.packageName?.toString() ?: return
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            p != packageName && p != "com.android.systemui"
+        ) {
+            currentPkg = p
+        }
+    }
 
     override fun onInterrupt() {}
 
@@ -120,7 +140,7 @@ class AutomationService : AccessibilityService() {
         ).apply {
             gravity = Gravity.TOP or Gravity.END
             x = 12
-            y = 260
+            y = 120
         }
         try {
             windowManager?.addView(box, params)
@@ -135,7 +155,7 @@ class AutomationService : AccessibilityService() {
         if (enabled) {
             resetTask()
             nextAllowedAt = 0L
-            setStatus("Bot jalan. Buka halaman Tugas PR.SOCIAL.")
+            setStatus("Bot jalan. Buka halaman Tugas.")
         } else {
             setStatus("Bot dimatikan.")
         }
@@ -160,7 +180,7 @@ class AutomationService : AccessibilityService() {
         loopJob?.cancel()
         loopJob = scope.launch {
             while (isActive) {
-                delay(Random.nextLong(1500, 3500))
+                delay(Random.nextLong(1800, 3200))
                 if (!enabled) continue
                 try {
                     tick()
@@ -171,60 +191,155 @@ class AutomationService : AccessibilityService() {
         }
     }
 
-    private fun tick() {
-        val root = rootInActiveWindow ?: return
-        val pkg = root.packageName?.toString() ?: return
+    private suspend fun tick() {
         val now = System.currentTimeMillis()
-
+        val pkg = rootInActiveWindow?.packageName?.toString() ?: currentPkg
         if (pkg == packageName) return
-        if (pkg == IG_PACKAGE) {
-            handleInstagram(root, now)
+
+        val bmp = captureBitmap()
+        if (bmp == null) {
+            setStatus("Gagal potret layar (kode $lastShotError)")
             return
         }
-        if (isPrSocial(root)) {
-            browserPkg = pkg
-            handlePr(root, now)
-        } else if (findAll(root, "pr.social").isNotEmpty()) {
-            browserPkg = pkg
-            setStatus("Isi halaman tidak terbaca (node=${countNodes(root)})")
+        val all = ocr(bmp)
+        bmp.recycle()
+        val ov = overlayRect()
+        val lines = all.filter { !ov.contains(it.rect.centerX(), it.rect.centerY()) }
+
+        if (pkg == IG_PACKAGE) {
+            handleInstagram(lines, now)
+            return
         }
+        val looksPr = lines.any {
+            it.norm.contains("ikuti di instagram") || it.norm.contains("periksa follow saya") ||
+                it.norm.contains("buka profil dan ikuti") || it.norm.contains("tugas saya")
+        }
+        if (looksPr) {
+            if (pkg != null) browserPkg = pkg
+            handlePr(lines, now)
+        } else {
+            setStatus("Halaman Tugas tidak terlihat (OCR ${lines.size} baris)")
+        }
+    }
+
+    // ---------------------------------------------------------------- Screenshot + OCR
+
+    private suspend fun captureBitmap(): Bitmap? = suspendCancellableCoroutine { cont ->
+        if (Build.VERSION.SDK_INT < 30) {
+            lastShotError = -1
+            cont.resume(null)
+            return@suspendCancellableCoroutine
+        }
+        try {
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(result: ScreenshotResult) {
+                        try {
+                            val hb = result.hardwareBuffer
+                            val hw = Bitmap.wrapHardwareBuffer(hb, result.colorSpace)
+                            val soft = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                            hb.close()
+                            cont.resume(soft)
+                        } catch (e: Exception) {
+                            lastShotError = -2
+                            cont.resume(null)
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        lastShotError = errorCode
+                        cont.resume(null)
+                    }
+                }
+            )
+        } catch (e: Exception) {
+            lastShotError = -3
+            cont.resume(null)
+        }
+    }
+
+    private suspend fun ocr(bmp: Bitmap): List<OcrLine> = suspendCancellableCoroutine { cont ->
+        recognizer.process(InputImage.fromBitmap(bmp, 0))
+            .addOnSuccessListener { t ->
+                val out = ArrayList<OcrLine>()
+                for (b in t.textBlocks) {
+                    for (l in b.lines) {
+                        val r = l.boundingBox ?: continue
+                        out.add(OcrLine(l.text, r))
+                    }
+                }
+                cont.resume(out)
+            }
+            .addOnFailureListener { cont.resume(emptyList()) }
+    }
+
+    private fun overlayRect(): Rect {
+        val o = overlay ?: return Rect()
+        val loc = IntArray(2)
+        o.getLocationOnScreen(loc)
+        return Rect(loc[0], loc[1], loc[0] + o.width, loc[1] + o.height)
     }
 
     // ---------------------------------------------------------------- Instagram
 
-    private fun handleInstagram(root: AccessibilityNodeInfo, now: Long) {
-        if (isBlocked(root)) {
+    private fun handleInstagram(lines: List<OcrLine>, now: Long) {
+        if (lines.any {
+                it.norm.contains("coba lagi nanti") || it.norm.contains("try again later") ||
+                    it.norm.contains("tindakan diblokir") || it.norm.contains("action blocked")
+            }
+        ) {
             enabled = false
             setStatus("⛔ Instagram membatasi akun. Bot dimatikan, istirahat dulu.")
             Toast.makeText(this, "Instagram membatasi aksi. Bot dimatikan.", Toast.LENGTH_LONG).show()
             return
         }
-        val already = findExact(root, "Mengikuti", "Following", "Diminta", "Requested")
-        val btn = findExact(root, "Ikuti", "Follow", "Ikuti balik", "Follow back")
+
+        val h = resources.displayMetrics.heightPixels
+        val msg = lines.firstOrNull { it.norm == "kirim pesan" || it.norm == "message" }
+
+        fun rowItem(pred: (String) -> Boolean): OcrLine? {
+            val cands = lines.filter { pred(it.norm) }
+            return if (msg != null) {
+                cands.minByOrNull { abs(it.rect.centerY() - msg.rect.centerY()) }
+                    ?.takeIf { abs(it.rect.centerY() - msg.rect.centerY()) < 90 }
+            } else {
+                cands.firstOrNull { it.rect.centerY() < h * 0.6 }
+            }
+        }
+
+        val following = rowItem {
+            it.startsWith("mengikuti") || it.startsWith("following") ||
+                it.startsWith("diminta") || it.startsWith("requested")
+        }
+        val followBtn = rowItem {
+            it == "ikuti" || it == "follow" || it == "ikuti balik" || it == "follow back"
+        }
 
         when (phase) {
             Phase.IN_INSTAGRAM -> {
-                if (already != null) {
+                if (following != null) {
                     returnToBrowser(now, "Sudah mengikuti")
-                } else if (btn != null) {
-                    clickNode(btn)
+                } else if (followBtn != null) {
+                    tap(followBtn.rect)
                     phase = Phase.IG_CLICKED
                     phaseSince = now
                     igRetries = 0
-                    setStatus("Menekan Ikuti…")
-                } else if (now - phaseSince > 20000) {
+                    setStatus("Menekan tombol Ikuti…")
+                } else if (now - phaseSince > 25000) {
                     returnToBrowser(now, "Tombol Ikuti tidak ketemu")
                 } else {
                     setStatus("Menunggu profil Instagram…")
                 }
             }
             Phase.IG_CLICKED -> {
-                if (already != null) {
+                if (following != null) {
                     returnToBrowser(now, "Berhasil mengikuti")
-                } else if (now - phaseSince > 6000) {
-                    if (btn != null && igRetries < 1) {
+                } else if (now - phaseSince > 7000) {
+                    if (followBtn != null && igRetries < 1) {
                         igRetries++
-                        clickNode(btn)
+                        tap(followBtn.rect)
                         phaseSince = now
                     } else {
                         returnToBrowser(now, "Lanjut verifikasi")
@@ -245,98 +360,79 @@ class AutomationService : AccessibilityService() {
         if (browserPkg != null) launchBrowser() else performGlobalAction(GLOBAL_ACTION_BACK)
         phase = Phase.RETURNING
         phaseSince = now
-        setStatus("$msg → kembali ke PR.SOCIAL")
+        setStatus("$msg, kembali ke halaman tugas")
     }
 
-    private fun isBlocked(root: AccessibilityNodeInfo): Boolean {
-        val keys = listOf(
-            "Coba lagi nanti", "Try again later", "Tindakan diblokir", "Action blocked",
-            "membatasi aktivitas", "We limit how often"
-        )
-        return keys.any { findAll(root, it).isNotEmpty() }
-    }
+    // ---------------------------------------------------------------- Halaman tugas
 
-    // ---------------------------------------------------------------- PR.SOCIAL
+    private fun handlePr(lines: List<OcrLine>, now: Long) {
+        val check = lines.firstOrNull { it.norm.contains("periksa follow saya") }
+        val reviewed = lines.any { it.norm.contains("ditinjau") }
+        val startBtn = lines.firstOrNull {
+            it.norm.startsWith("mulai") && !it.norm.contains("dalam") && it.norm.any { c -> c.isDigit() }
+        }
+        val confirmMark = lines.any { it.norm.contains("konfirmasi follow anda") }
+        val modalOpen = check != null || startBtn != null || confirmMark || reviewed
 
-    private fun isPrSocial(root: AccessibilityNodeInfo): Boolean {
-        val keys = listOf("Periksa follow saya", "Ikuti di Instagram", "Buka profil dan ikuti", "Mulai ·")
-        return keys.any { findAll(root, it).isNotEmpty() }
-    }
-
-    private fun handlePr(root: AccessibilityNodeInfo, now: Long) {
-        val check = findFirst(root, "Periksa follow saya")
-
-        if (phase == Phase.CHECKING && (check == null || findAll(root, "ditinjau").isNotEmpty())) {
+        if (phase == Phase.CHECKING && (check == null || reviewed)) {
             onTaskDone(now)
             return
         }
 
-        if (check == null) {
-            val start = findStartButton(root)
-            if (start != null) {
-                if (!canStartNew(now)) return
-                clickNode(start)
-                phase = Phase.LIST
-                phaseSince = now
-                setStatus("Menekan Mulai…")
-                return
-            }
-            // Jendela tugas tidak terbuka
-            when (phase) {
-                Phase.CHECKING -> {
-                    onTaskDone(now)
-                    return
-                }
-                Phase.LIST -> listStep(root, now)
-                else -> {
-                    if (now - phaseSince > 15000) {
-                        resetTask()
-                    } else {
-                        setStatus("Menunggu halaman PR.SOCIAL…")
-                    }
-                }
+        if (check == null && startBtn != null) {
+            if (!canStartNew(now)) return
+            tap(startBtn.rect)
+            phase = Phase.LIST
+            phaseSince = now
+            setStatus("Menekan Mulai…")
+            return
+        }
+
+        if (!modalOpen) {
+            if (phase == Phase.LIST) {
+                listStep(lines, now)
+            } else if (now - phaseSince > 15000) {
+                resetTask()
+            } else {
+                setStatus("Menunggu halaman tugas…")
             }
             return
         }
 
-        // Jendela tugas terbuka
+        if (check == null) {
+            // modal terbuka tapi belum jelas, tunggu
+            setStatus("Menunggu jendela tugas…")
+            return
+        }
+
         when (phase) {
             Phase.LIST -> {
                 if (!canStartNew(now)) return
-                val link = findFirst(root, "instagram.com/")
-                val linkText = link?.text?.toString() ?: ""
-                currentUser = if (linkText.contains("…") || linkText.contains("...")) null
-                else Regex("instagram\\.com/([A-Za-z0-9._]+)").find(linkText)?.groupValues?.get(1)
-                val ok = link != null && clickNode(link)
-                if (!ok) openInstagramDirect()
+                val link = lines.firstOrNull { it.norm.contains("instagram.com") }
+                    ?: lines.firstOrNull { it.norm.contains("buka profil dan ikuti") }
+                if (link != null) tap(link.rect)
                 phase = Phase.IN_INSTAGRAM
                 phaseSince = now
                 checkAttempts = 0
                 igRetries = 0
-                triedDirect = false
                 setStatus("Membuka profil Instagram…")
             }
             Phase.IN_INSTAGRAM -> {
-                if (now - phaseSince > 40000) {
-                    cancelTask(root, now)
-                } else if (now - phaseSince > 8000 && !triedDirect) {
-                    triedDirect = true
-                    openInstagramDirect()
-                }
+                if (now - phaseSince > 40000) cancelTask(lines, now)
             }
             Phase.IG_CLICKED, Phase.RETURNING -> {
-                clickNode(check)
+                tap(check.rect)
                 phase = Phase.CHECKING
                 phaseSince = now
                 checkAttempts = 1
-                setStatus("Menekan 'Periksa follow saya'…")
+                setStatus("Menekan tombol periksa…")
             }
             Phase.CHECKING -> {
                 if (now - phaseSince > 9000) {
                     if (checkAttempts >= 3) {
-                        cancelTask(root, now)
+                        cancelTask(lines, now)
                     } else {
-                        clickNode(check)
+                        tap(check.rect)
                         checkAttempts++
                         phaseSince = now
                         setStatus("Coba periksa lagi ($checkAttempts/3)")
@@ -346,41 +442,40 @@ class AutomationService : AccessibilityService() {
         }
     }
 
+    private fun listStep(lines: List<OcrLine>, now: Long) {
+        if (!canStartNew(now)) return
+        val h = resources.displayMetrics.heightPixels
+        val row = lines
+            .filter {
+                it.norm.contains("ikuti di instagram") &&
+                    it.rect.centerY() > h * 0.18 && it.rect.centerY() < h * 0.85
+            }
+            .minByOrNull { it.rect.top }
+        if (row == null) {
+            idleTicks++
+            setStatus("Tidak ada tugas Follow terlihat (OCR ${lines.size} baris)")
+            if (idleTicks >= 30) {
+                idleTicks = 0
+                launchBrowser()
+            }
+            return
+        }
+        idleTicks = 0
+        tap(row.rect)
+        phaseSince = now
+        setStatus("Membuka tugas…")
+    }
+
     private fun canStartNew(now: Long): Boolean {
         if (now < nextAllowedAt) {
             setStatus("Jeda ${(nextAllowedAt - now) / 1000} detik…")
             return false
         }
         if (recentCount(now) >= MAX_PER_HOUR) {
-            setStatus("Batas $MAX_PER_HOUR/jam tercapai. Menunggu…")
+            setStatus("Batas $MAX_PER_HOUR per jam tercapai. Menunggu…")
             return false
         }
         return true
-    }
-
-    private fun listStep(root: AccessibilityNodeInfo, now: Long) {
-        if (now < nextAllowedAt) {
-            setStatus("Jeda ${(nextAllowedAt - now) / 1000} detik…")
-            return
-        }
-        if (recentCount(now) >= MAX_PER_HOUR) {
-            setStatus("Batas $MAX_PER_HOUR/jam tercapai. Menunggu…")
-            return
-        }
-        val row = findFirst(root, "Ikuti di Instagram")
-        if (row == null) {
-            idleTicks++
-            setStatus("Tidak ada tugas Follow terlihat (cocok=${findAll(root, "Ikuti di Instagram").size}, node=${countNodes(root)})")
-            if (idleTicks >= 30) {
-                idleTicks = 0
-                refreshPage()
-            }
-            return
-        }
-        idleTicks = 0
-        clickNode(row)
-        phaseSince = now
-        setStatus("Membuka tugas…")
     }
 
     private fun onTaskDone(now: Long) {
@@ -391,8 +486,8 @@ class AutomationService : AccessibilityService() {
         setStatus("✅ Tugas selesai. Jeda sebelum tugas berikutnya.")
     }
 
-    private fun cancelTask(root: AccessibilityNodeInfo, now: Long) {
-        findFirst(root, "Batalkan tugas")?.let { clickNode(it) }
+    private fun cancelTask(lines: List<OcrLine>, now: Long) {
+        lines.firstOrNull { it.norm.contains("batalkan tugas") }?.let { tap(it.rect) }
         resetTask()
         nextAllowedAt = now + 30000
         setStatus("Tugas dibatalkan (gagal). Lanjut berikutnya.")
@@ -403,8 +498,6 @@ class AutomationService : AccessibilityService() {
         phaseSince = System.currentTimeMillis()
         checkAttempts = 0
         igRetries = 0
-        triedDirect = false
-        currentUser = null
     }
 
     private fun recentCount(now: Long): Int {
@@ -412,17 +505,7 @@ class AutomationService : AccessibilityService() {
         return doneTimes.size
     }
 
-    // ---------------------------------------------------------------- Navigasi
-
-    private fun openInstagramDirect() {
-        val user = currentUser ?: return
-        try {
-            val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.instagram.com/$user/"))
-                .setPackage(IG_PACKAGE)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(i)
-        } catch (_: Exception) {}
-    }
+    // ---------------------------------------------------------------- Aksi
 
     private fun launchBrowser() {
         val pkg = browserPkg ?: return
@@ -434,81 +517,11 @@ class AutomationService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
-    private fun refreshPage() {
-        val pkg = browserPkg ?: return
-        try {
-            val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://pr.social/tasks?net=instagram"))
-                .setPackage(pkg)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(i)
-        } catch (_: Exception) {}
-    }
-
-    // ---------------------------------------------------------------- Helper node
-
-    private fun countNodes(n: AccessibilityNodeInfo?, limit: Int = 3000): Int {
-        if (n == null) return 0
-        var c = 1
-        for (i in 0 until n.childCount) {
-            if (c >= limit) break
-            c += countNodes(n.getChild(i), limit - c)
-        }
-        return c
-    }
-
-    private fun findAll(root: AccessibilityNodeInfo, text: String): List<AccessibilityNodeInfo> =
-        root.findAccessibilityNodeInfosByText(text) ?: emptyList()
-
-    private fun onScreen(n: AccessibilityNodeInfo): Boolean {
-        if (n.isVisibleToUser) return true
-        val r = Rect()
-        n.getBoundsInScreen(r)
-        val h = resources.displayMetrics.heightPixels
-        return r.width() > 0 && r.height() > 0 && r.top >= 0 && r.bottom <= h
-    }
-
-    private fun findFirst(root: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? =
-        findAll(root, text).firstOrNull { onScreen(it) }
-
-    private fun findStartButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? =
-        findAll(root, "Mulai").firstOrNull { n ->
-            val t = n.text?.toString()?.trim() ?: n.contentDescription?.toString()?.trim() ?: ""
-            t.startsWith("Mulai", ignoreCase = true) && t.contains("$") && onScreen(n)
-        }
-
-    private fun findExact(root: AccessibilityNodeInfo, vararg labels: String): AccessibilityNodeInfo? {
-        for (label in labels) {
-            val hit = findAll(root, label).firstOrNull { n ->
-                onScreen(n) && (
-                    n.text?.toString()?.trim().equals(label, ignoreCase = true) ||
-                        n.contentDescription?.toString()?.trim().equals(label, ignoreCase = true)
-                    )
-            }
-            if (hit != null) return hit
-        }
-        return null
-    }
-
-    private fun clickNode(node: AccessibilityNodeInfo): Boolean {
-        var cur: AccessibilityNodeInfo? = node
-        var depth = 0
-        while (cur != null && depth < 6) {
-            if (cur.isClickable && cur.isEnabled && cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                return true
-            }
-            cur = cur.parent
-            depth++
-        }
-        return tapNode(node)
-    }
-
-    private fun tapNode(node: AccessibilityNodeInfo): Boolean {
-        val r = Rect()
-        node.getBoundsInScreen(r)
+    private fun tap(r: Rect): Boolean {
         if (r.isEmpty) return false
         val path = Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 80))
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 90))
             .build()
         return dispatchGesture(gesture, null, null)
     }
