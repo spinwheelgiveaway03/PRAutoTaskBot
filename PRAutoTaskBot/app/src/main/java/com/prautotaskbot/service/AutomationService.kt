@@ -88,7 +88,7 @@ class AutomationService : AccessibilityService() {
     private var breakAfter = Random.nextInt(BREAK_EVERY_MIN, BREAK_EVERY_MAX + 1)
     private var blockedUntil = 0L
     private var warmStart = 0L
-    private var failStreak = 0
+    private var needIgTabUntil = 0L
     private val safePrefs by lazy { getSharedPreferences("safety", MODE_PRIVATE) }
     private var statusText = "Siap. Tekan tombol untuk mulai."
 
@@ -354,7 +354,8 @@ class AutomationService : AccessibilityService() {
         ) {
             enabled = false
             blockedUntil = now + BLOCK_LOCK_MS
-            safePrefs.edit().putLong("blockedUntil", blockedUntil).apply()
+            warmStart = blockedUntil
+            safePrefs.edit().putLong("blockedUntil", blockedUntil).putLong("warmStart", warmStart).apply()
             setStatus("⛔ Instagram membatasi akun. Bot dimatikan dan dikunci 12 jam.")
             Toast.makeText(this, "Instagram membatasi aksi. Bot dimatikan.", Toast.LENGTH_LONG).show()
             return
@@ -502,14 +503,6 @@ class AutomationService : AccessibilityService() {
 
     /** Gagal menemukan/menekan Ikuti: kembali ke web lalu buka profil lagi (bukan menekan Periksa). */
     private fun retryProfile(now: Long, msg: String) {
-        failStreak++
-        if (failStreak >= MAX_FAIL_STREAK) {
-            enabled = false
-            blockedUntil = now + SOFT_LOCK_MS
-            safePrefs.edit().putLong("blockedUntil", blockedUntil).apply()
-            setStatus("⛔ Follow gagal berulang, kemungkinan dibatasi. Istirahat 3 jam.")
-            return
-        }
         igAttempts++
         verifiedFollow = false
         tapY = -1
@@ -523,6 +516,15 @@ class AutomationService : AccessibilityService() {
     // ---------------------------------------------------------------- Halaman tugas
 
     private fun handlePr(lines: List<OcrLine>, now: Long) {
+        // PR.SOCIAL menjeda tugas IG karena follow dari akun tidak terdeteksi
+        if (lines.any { it.norm.contains("dijeda sampai") }) {
+            enabled = false
+            blockedUntil = now + PR_PAUSE_LOCK_MS
+            warmStart = blockedUntil
+            safePrefs.edit().putLong("blockedUntil", blockedUntil).putLong("warmStart", warmStart).apply()
+            setStatus("⛔ PR.SOCIAL menjeda tugas IG (follow tidak terdeteksi). Bot dimatikan 24 jam.")
+            return
+        }
         val check = lines.firstOrNull { it.norm.contains("periksa follow saya") }
         val reviewed = lines.any { it.norm.contains("ditinjau") }
         val startBtn = lines.firstOrNull {
@@ -530,6 +532,26 @@ class AutomationService : AccessibilityService() {
         }
         val confirmMark = lines.any { it.norm.contains("konfirmasi follow anda") }
         val modalOpen = check != null || startBtn != null || confirmMark || reviewed
+
+        // Setelah web di-refresh tampilan pindah ke "Semua": klik tab Instagram
+        // (tab tepat di kanan "Semua"; hanya untuk tampilan HP dengan menu bawah)
+        if (now < needIgTabUntil && !modalOpen) {
+            val sw = resources.displayMetrics.widthPixels
+            val sh = resources.displayMetrics.heightPixels
+            val mobileNav = lines.any { it.norm == "dompet" && it.rect.centerY() > sh * 0.88 }
+            val semua = lines.firstOrNull {
+                it.norm == "semua" && it.rect.centerY() > sh * 0.12 && it.rect.centerY() < sh * 0.35
+            }
+            if (mobileNav && semua != null) {
+                val x = semua.rect.centerX() + (sw * 0.189f).toInt()
+                val y = semua.rect.centerY() - 40
+                tap(Rect(x - 6, y - 6, x + 6, y + 6))
+                needIgTabUntil = 0L
+                phaseSince = now
+                setStatus("Memilih tab Instagram…")
+                return
+            }
+        }
 
         if (phase == Phase.CHECKING && (check == null || reviewed)) {
             onTaskDone(now)
@@ -697,7 +719,6 @@ class AutomationService : AccessibilityService() {
 
     private fun onTaskDone(now: Long) {
         doneCount++
-        failStreak = 0
         lastProgressAt = now
         doneTimes.add(now)
         dayTimes.add(now)
@@ -760,6 +781,7 @@ class AutomationService : AccessibilityService() {
 
     private fun refreshPage() {
         val pkg = browserPkg ?: return
+        needIgTabUntil = System.currentTimeMillis() + 20_000L
         try {
             val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://pr.social/tasks?net=instagram"))
                 .setPackage(pkg)
@@ -780,7 +802,7 @@ class AutomationService : AccessibilityService() {
     /** Batas harian naik pelan-pelan (pemanasan akun) sampai MAX_PER_DAY. */
     private fun dayLimit(now: Long): Int {
         if (warmStart == 0L) return WARMUP_START
-        val days = ((now - warmStart) / 86_400_000L).toInt()
+        val days = maxOf(0, ((now - warmStart) / 86_400_000L).toInt())
         return minOf(MAX_PER_DAY, WARMUP_START + days * WARMUP_STEP)
     }
 
@@ -840,14 +862,13 @@ class AutomationService : AccessibilityService() {
         private const val IG_PACKAGE = "com.instagram.android"
         // ---- Pengaman akun (ubah angka di sini kalau mau lebih cepat / lebih aman)
         private const val MAX_PER_HOUR = 25
+        private const val PR_PAUSE_LOCK_MS = 86_400_000L // kunci 24 jam kalau PR.SOCIAL menjeda tugas IG
         private const val MAX_PER_DAY = 150             // batas harian akhir (setelah pemanasan)
         private const val WARMUP_START = 30             // hari ke-1 hanya 30 tugas
         private const val WARMUP_STEP = 20              // naik 20 tugas tiap hari sampai MAX_PER_DAY
         private const val QUIET_ENABLED = false         // bot tidur di jam sepi (pola wajar)
         private const val QUIET_START = 12              // jam 12:00
         private const val QUIET_END = 16                // sampai 16:00
-        private const val MAX_FAIL_STREAK = 8           // gagal ikuti berturut-turut -> istirahat
-        private const val SOFT_LOCK_MS = 10_800_000L    // istirahat 3 jam
         private const val PACE_MIN_MS = 8_000L          // jeda antar tugas
         private const val PACE_MAX_MS = 20_000L
         private const val BREAK_EVERY_MIN = 8           // istirahat panjang tiap 8-14 tugas
